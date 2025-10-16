@@ -1,0 +1,106 @@
+name: Deploy to AWS EC2
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup SSH
+      uses: webfactory/ssh-agent@v0.7.0
+      with:
+        ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+        
+    - name: Add server to known hosts
+      run: |
+        ssh-keyscan -H ${{ secrets.HOST }} >> ~/.ssh/known_hosts
+        
+    - name: Deploy to server
+      run: |
+        # Create deployment directory
+        ssh ubuntu@${{ secrets.HOST }} "sudo mkdir -p /var/www/html && sudo chown ubuntu:ubuntu /var/www/html"
+        
+        # Copy files to server
+        scp index.html ubuntu@${{ secrets.HOST }}:/var/www/html/
+        scp -r assets ubuntu@${{ secrets.HOST }}:/var/www/html/ 2>/dev/null || true
+        
+        # Install and configure NGINX
+        ssh ubuntu@${{ secrets.HOST }} << 'EOF'
+          # Update system
+          sudo apt update
+          
+          # Install NGINX if not already installed
+          sudo apt install -y nginx
+          
+          # Configure firewall
+          sudo ufw allow 'Nginx HTTP'
+          sudo ufw allow ssh
+          sudo ufw --force enable
+          
+          # Set proper permissions
+          sudo chown -R www-data:www-data /var/www/html/
+          sudo chmod -R 755 /var/www/html/
+          
+          # Configure NGINX
+          sudo tee /etc/nginx/sites-available/default > /dev/null << 'NGINX_CONFIG'
+        server {
+            listen 80 default_server;
+            listen [::]:80 default_server;
+            
+            root /var/www/html;
+            index index.html index.htm;
+            
+            server_name _;
+            
+            location / {
+                try_files $uri $uri/ =404;
+            }
+            
+            # Security headers
+            add_header X-Frame-Options "SAMEORIGIN" always;
+            add_header X-XSS-Protection "1; mode=block" always;
+            add_header X-Content-Type-Options "nosniff" always;
+            
+            # Gzip compression
+            gzip on;
+            gzip_vary on;
+            gzip_min_length 1024;
+            gzip_types text/plain text/css text/xml text/javascript application/javascript application/xml+rss application/json;
+        }
+        NGINX_CONFIG
+          
+          # Test NGINX configuration
+          sudo nginx -t
+          
+          # Restart NGINX
+          sudo systemctl restart nginx
+          sudo systemctl enable nginx
+          
+          # Verify deployment
+          curl -f http://localhost/ || exit 1
+          echo "Deployment successful!"
+        EOF
+        
+    - name: Health Check
+      run: |
+        sleep 10
+        curl -f http://${{ secrets.HOST }}/ || (echo "Health check failed!" && exit 1)
+        echo "Health check passed!"
+        
+    - name: Notify Deployment Status
+      if: always()
+      run: |
+        if [ ${{ job.status }} == 'success' ]; then
+          echo "✅ Deployment successful! Website is live at: http://${{ secrets.HOST }}/"
+        else
+          echo "❌ Deployment failed!"
+          exit 1
+        fi
